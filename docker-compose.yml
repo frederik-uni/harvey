@@ -20,3 +20,54 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # Opt-in remote dashboard for a named Cloudflare Tunnel. Enable all three
+  # services with COMPOSE_PROFILES=cloudflare. The dashboard itself still
+  # listens only on loopback; Caddy is the narrow adapter that rewrites the
+  # proxy request to the loopback Host/Origin Harvey requires.
+  dashboard:
+    profiles: [cloudflare]
+    build: .
+    command: ["harvey", "dashboard", "--host", "127.0.0.1", "--port", "5555"]
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./harvey.yaml:/app/harvey.yaml:ro
+      - ./prompts:/app/prompts:ro
+      - ./skills:/app/skills
+    restart: unless-stopped
+    init: true
+
+  dashboard-proxy:
+    profiles: [cloudflare]
+    image: caddy:2.10-alpine
+    network_mode: "service:dashboard"
+    command:
+      - caddy
+      - reverse-proxy
+      - --from
+      - :8080
+      - --to
+      - 127.0.0.1:5555
+      - --header-up
+      - "Host: 127.0.0.1:5555"
+      - --header-up
+      - "Origin: http://127.0.0.1:5555"
+    depends_on:
+      - dashboard
+    restart: unless-stopped
+
+  cloudflared:
+    profiles: [cloudflare]
+    image: cloudflare/cloudflared:latest
+    network_mode: "service:dashboard"
+    command:
+      - tunnel
+      - --no-autoupdate
+      - run
+      - --token
+      - ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - dashboard
+      - dashboard-proxy
+    restart: unless-stopped
