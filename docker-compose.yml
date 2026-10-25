@@ -11,8 +11,8 @@ services:
         exec python -m harvey.main
     env_file: .env
     volumes:
-      # Persist database across restarts
-      - ./data:/app/data
+      # Named volumes survive Dokploy replacing its deployment checkout.
+      - harvey-data:/app/data
       # Mount config for easy editing without rebuild
       - ./harvey.yaml:/app/harvey.yaml:ro
       - ./prompts:/app/prompts:ro
@@ -49,7 +49,7 @@ services:
         exec python -m harvey.cli dashboard --host 127.0.0.1 --port 5555
     env_file: .env
     volumes:
-      - ./data:/app/data
+      - harvey-data:/app/data
       - ./harvey.yaml:/app/harvey.yaml:ro
       - ./prompts:/app/prompts:ro
       - ./skills:/app/skills
@@ -91,4 +91,5 @@ services:
     restart: unless-stopped
 
 volumes:
+  harvey-data:
   codex-auth:
