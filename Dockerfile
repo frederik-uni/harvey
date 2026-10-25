@@ -5,9 +5,11 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-# System deps (curl needed for the Claude CLI installer)
+# System deps (curl for Claude; Node/npm for the pinned Codex CLI)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates \
+    curl ca-certificates nodejs npm \
+    && npm install -g @openai/codex@0.159.3 \
+    && codex --version | grep -F "0.159.3" \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -21,8 +23,8 @@ RUN pip install --no-cache-dir -r requirements.txt \
 
 # Non-root user; owns app data and the shared browser install
 RUN useradd --create-home --uid 1000 harvey \
-    && mkdir -p /app/data \
-    && chown -R harvey:harvey /app /ms-playwright
+    && mkdir -p /app/data /home/harvey/.codex \
+    && chown -R harvey:harvey /app /ms-playwright /home/harvey/.codex
 
 # Copy project (config/prompts are typically bind-mounted over these at runtime)
 COPY --chown=harvey:harvey harvey/ harvey/

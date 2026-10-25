@@ -1,6 +1,14 @@
 services:
   harvey:
     build: .
+    command:
+      - /bin/sh
+      - -c
+      - |
+        test -f /app/data/harvey.local.yaml ||
+          cp /app/harvey.yaml /app/data/harvey.local.yaml
+        ln -sf /app/data/harvey.local.yaml /app/harvey.local.yaml
+        exec python -m harvey.main
     env_file: .env
     volumes:
       # Persist database across restarts
@@ -13,6 +21,9 @@ services:
       # Not read-only: the CLI refreshes OAuth tokens in place.
       # The container runs as non-root user "harvey" (uid 1000).
       - ~/.claude:/home/harvey/.claude
+      # Codex login survives rebuilds and redeploys. Harvey reads this login
+      # but runs every model call from a separate, throwaway CODEX_HOME.
+      - codex-auth:/home/harvey/.codex
     restart: unless-stopped
     init: true
     logging:
@@ -28,7 +39,14 @@ services:
   dashboard:
     profiles: [cloudflare]
     build: .
-    command: ["harvey", "dashboard", "--host", "127.0.0.1", "--port", "5555"]
+    command:
+      - /bin/sh
+      - -c
+      - |
+        test -f /app/data/harvey.local.yaml ||
+          cp /app/harvey.yaml /app/data/harvey.local.yaml
+        ln -sf /app/data/harvey.local.yaml /app/harvey.local.yaml
+        exec python -m harvey.cli dashboard --host 127.0.0.1 --port 5555
     env_file: .env
     volumes:
       - ./data:/app/data
@@ -71,3 +89,6 @@ services:
       - dashboard
       - dashboard-proxy
     restart: unless-stopped
+
+volumes:
+  codex-auth:
