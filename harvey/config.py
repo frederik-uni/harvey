@@ -515,6 +515,13 @@ class EnvConfig(BaseModel):
     dataforseo_login: str = ""
     dataforseo_password: str = ""
     dataforseo_sandbox: str = ""   # any truthy value routes to the free sandbox
+    google_maps_api_key: str = ""
+    google_search_api_key: str = ""
+    google_search_engine_id: str = ""
+    # Conservative local guards. They prevent Harvey from crossing the free
+    # allowances; a lower value is useful when the key is shared elsewhere.
+    google_places_monthly_limit: int = 1000
+    google_search_daily_limit: int = 100
     linkedin_email: str = ""
     linkedin_password: str = ""
     hunter_api_key: str = ""
@@ -631,6 +638,13 @@ def load_env() -> EnvConfig:
         dataforseo_login=os.getenv("DATAFORSEO_LOGIN", "").strip(),
         dataforseo_password=os.getenv("DATAFORSEO_PASSWORD", "").strip(),
         dataforseo_sandbox=os.getenv("DATAFORSEO_SANDBOX", "").strip(),
+        google_maps_api_key=os.getenv("GOOGLE_MAPS_API_KEY", "").strip(),
+        google_search_api_key=os.getenv("GOOGLE_SEARCH_API_KEY", "").strip(),
+        google_search_engine_id=os.getenv("GOOGLE_SEARCH_ENGINE_ID", "").strip(),
+        google_places_monthly_limit=max(
+            0, int(os.getenv("GOOGLE_PLACES_MONTHLY_LIMIT", "1000").strip() or 1000)),
+        google_search_daily_limit=max(
+            0, int(os.getenv("GOOGLE_SEARCH_DAILY_LIMIT", "100").strip() or 100)),
         linkedin_email=os.getenv("LINKEDIN_EMAIL", "").strip(),
         linkedin_password=os.getenv("LINKEDIN_PASSWORD", "").strip(),
         hunter_api_key=os.getenv("HUNTER_API_KEY", "").strip(),

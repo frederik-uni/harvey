@@ -212,6 +212,12 @@ harvey discover               # go
 | **DataForSEO Business Listings** | $0.372 / 1,000 | $1 credit | Local trades, clinics, contractors. Phone, domain, rating, claimed status — and it can filter for businesses with **no website at all**. |
 | **DataForSEO SERP** | $0.0018 / search | $1 credit + free sandbox | Rank as the buying signal. |
 | **Serper** | ~$0.30–1.00 / 1,000 | 2,500 free, no card | The easiest paid one to try. |
+| **Google Places API (New)** | guarded at free usage | 1,000 requests/month by default | Direct Google Maps business discovery with phone, website, category, rating and review count. Harvey persistently counts requests and stops at the configured limit. |
+| **Google Custom Search** | guarded at free usage | 100 requests/day | Official Programmable Search results. Requires an API key and Search Engine ID; Harvey stops before the configured daily limit. |
+
+Use `--provider google_places` for Maps listings or `--provider google_serp`
+for Programmable Search. Configure their keys and optional lower quota limits in
+`.env`; the provider menu reports anything missing.
 
 **Selling to startups?** Harvey has a built-in YC-startup skill, made of three
 parts:

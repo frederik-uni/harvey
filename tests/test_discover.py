@@ -9,6 +9,7 @@ anyone, and that directories never make it in.
 import asyncio
 import os
 from contextlib import closing
+from datetime import datetime, timezone
 import tempfile
 
 import httpx
@@ -229,6 +230,39 @@ async def test_rerun_finds_everyone_already_known(state, config, register):
 
 
 @pytest.mark.asyncio
+async def test_cross_provider_websiteless_business_dedupes_by_phone(
+        state, config, register):
+    google = biz(
+        name="No Site Roofing", phone="+1 (555) 010-1234",
+        external_id="google_places:abc", has_website=False)
+    dfs = biz(
+        name="No Site Roofing LLC", phone="1-555-010-1234",
+        domain="nositeroofing.com", website="https://nositeroofing.com",
+        external_id="dataforseo:xyz", has_website=True)
+    fake = register(FakeProvider([[google], [dfs]]))
+    query = [D.DiscoveryQuery(term="roofer", location="Denver")]
+
+    first = await D.run_discovery(state, config, fake.key, query)
+    second = await D.run_discovery(state, config, fake.key, query)
+
+    assert first.new_companies == 1
+    assert second.new_companies == 0 and second.known_companies == 1
+    company = await state.get_company_by_domain("nositeroofing.com")
+    assert company is not None
+    assert company.phone == "+1 (555) 010-1234"
+
+
+@pytest.mark.asyncio
+async def test_shared_phone_is_too_ambiguous_to_merge(state):
+    from harvey.models import Company
+
+    await state.add_company(Company(name="Branch A", phone="+1 555 010 1234"))
+    await state.add_company(Company(name="Branch B", phone="(555) 010-1234"))
+
+    assert await state.get_company_by_phone("555-010-1234") is None
+
+
+@pytest.mark.asyncio
 async def test_websiteless_businesses_are_kept_and_deduped(state, config, register):
     """The best prospect for someone selling websites has no website, so
     `domain` can't be the only identity key."""
@@ -445,6 +479,101 @@ async def test_serper_adapter():
 
 
 @pytest.mark.asyncio
+async def test_google_places_adapter_normalizes_maps_businesses(monkeypatch):
+    provider = D.GooglePlaces()
+    seen = {}
+    response = D.places_v1.SearchTextResponse(places=[
+        D.places_v1.Place(
+            id="ChIJabc",
+            display_name={"text": "Northvale Roofing"},
+            formatted_address="1 Main St, Denver, CO",
+            primary_type_display_name={"text": "Roofing contractor"},
+            website_uri="https://www.northvale.com/",
+            national_phone_number="(555) 0100",
+            rating=4.7,
+            user_rating_count=81,
+            google_maps_uri="https://maps.google.com/?cid=1",
+            business_status=D.places_v1.Place.BusinessStatus.OPERATIONAL,
+        ),
+        D.places_v1.Place(
+            id="closed",
+            display_name={"text": "Closed Roofing"},
+            business_status=D.places_v1.Place.BusinessStatus.CLOSED_PERMANENTLY,
+        ),
+    ])
+
+    class Transport:
+        async def close(self):
+            seen["closed"] = True
+
+    class FakePlacesClient:
+        def __init__(self, client_options):
+            seen["key"] = client_options.api_key
+            self.transport = Transport()
+
+        async def search_text(self, request, metadata, timeout):
+            seen["mask"] = dict(metadata)["x-goog-fieldmask"]
+            seen["query"] = request.text_query
+            seen["limit"] = request.max_result_count
+            return response
+
+    monkeypatch.setattr(D.places_v1, "PlacesAsyncClient", FakePlacesClient)
+    async with _client(lambda r: httpx.Response(500)) as client:
+        out = await provider.fetch(
+            client, {"google_maps_api_key": "maps-key"},
+            D.DiscoveryQuery(term="roofer", location="Denver, CO", limit=20))
+
+    assert seen["key"] == "maps-key" and seen["query"] == "roofer Denver, CO"
+    assert seen["limit"] == 20
+    assert "places.websiteUri" in seen["mask"]
+    assert seen["closed"] is True
+    assert len(out) == 1
+    assert out[0].domain == "northvale.com"
+    assert out[0].external_id == "google_places:ChIJabc"
+    assert out[0].rating == 4.7 and out[0].review_count == 81
+
+
+@pytest.mark.asyncio
+async def test_google_search_adapter_paginates_and_assigns_rank(monkeypatch):
+    provider = D.GoogleSearch()
+    starts = []
+
+    class Request:
+        def __init__(self, start):
+            self.start = start
+
+        def execute(self):
+            starts.append(self.start)
+            return {"items": [{
+                "title": f"Acme Roofing - result {self.start}",
+                "link": f"https://acme{self.start}.com/",
+            }]}
+
+    class CSE:
+        def list(self, **kwargs):
+            return Request(kwargs["start"])
+
+    class Service:
+        def cse(self):
+            return CSE()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(D, "google_build", lambda *a, **k: Service())
+    async with _client(lambda r: httpx.Response(500)) as client:
+        out = await provider.fetch(
+            client,
+            {"google_search_api_key": "search-key",
+             "google_search_engine_id": "engine-id"},
+            D.DiscoveryQuery(term="roofer", location="Denver", depth=12))
+
+    assert starts == [1, 11]
+    assert [b.rank for b in out] == [1, 11]
+    assert [b.domain for b in out] == ["acme1.com", "acme11.com"]
+
+
+@pytest.mark.asyncio
 async def test_dataforseo_errors_surface_the_message_not_just_the_code():
     """A bare status code costs several wrong guesses; the body usually makes
     the problem obvious."""
@@ -475,6 +604,32 @@ def test_provider_menu_explains_cost_and_configuration():
         "DATAFORSEO_LOGIN", "DATAFORSEO_PASSWORD"]
     for entry in menu.values():
         assert entry["blurb"] and entry["cost_note"] and entry["signup_url"]
+
+
+@pytest.mark.asyncio
+async def test_provider_quota_limit_stops_before_an_extra_api_call(
+        state, config, register):
+    class Capped(FakeProvider):
+        def quota_limit(self, env):
+            return 1
+
+    fake = register(Capped([[biz(domain="first.com")], [biz(domain="second.com")]]))
+    report = await D.run_discovery(
+        state, config, "fake",
+        [D.DiscoveryQuery(term="roofer", location="A", limit=1),
+         D.DiscoveryQuery(term="roofer", location="B", limit=1)])
+
+    assert fake.calls == 1
+    assert report.stopped == "free quota reached"
+    assert report.new_companies == 1
+
+
+def test_google_quota_periods_match_provider_allowances():
+    now = datetime(2026, 3, 15, 12, tzinfo=timezone.utc)
+    assert D.GooglePlaces().quota_period(now) == "2026-03"
+    assert D.GoogleSearch().quota_period(now) == "2026-03-15"
+    assert D.GooglePlaces().quota_limit({}) == 1000
+    assert D.GoogleSearch().quota_limit({}) == 100
 
 
 def test_the_default_provider_needs_no_account():

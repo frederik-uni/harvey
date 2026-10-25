@@ -24,11 +24,15 @@ import asyncio
 import base64
 import logging
 import re
+from datetime import datetime, timezone
 from html import unescape
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 import httpx
+from google.api_core.client_options import ClientOptions
+from googleapiclient.discovery import build as google_build
+from google.maps import places_v1
 
 from harvey.models import Company
 
@@ -384,6 +388,18 @@ class DiscoveryProvider:
     # records what actually happened, not what was projected.
     last_cost: float = 0.0
 
+    def quota_limit(self, env: dict) -> int | None:
+        """Local free-usage guard, or None when the provider has no cap."""
+        return None
+
+    def quota_period(self, now: datetime) -> str:
+        """Counter bucket for the current allowance period."""
+        return now.date().isoformat()
+
+    def request_units(self, query: DiscoveryQuery) -> int:
+        """Maximum API requests fetch() will make for this query."""
+        return 1
+
 
 class DataForSEOListings(DiscoveryProvider):
     """Google Business Profile data as a queryable database, not a scrape.
@@ -587,6 +603,152 @@ class Serper(DiscoveryProvider):
         return out
 
 
+class GooglePlaces(DiscoveryProvider):
+    """Direct local-business discovery through Places API (New) Text Search."""
+
+    key = "google_places"
+    label = "Google Places API (New)"
+    kind = "listings"
+    blurb = ("Search Google Maps directly for local businesses, including phone, "
+             "website, category, rating, review count and business status.")
+    cost_note = ("free while Harvey's local request guard remains inside the "
+                 "configured allowance; Google bills by requested field tier")
+    free_tier = ("Harvey defaults to 1,000 requests per UTC calendar month; set "
+                 "GOOGLE_PLACES_MONTHLY_LIMIT lower for a shared key")
+    signup_url = "https://console.cloud.google.com/google/maps-apis"
+    env_keys = ("google_maps_api_key",)
+    caveat = ("Results are ranked rather than an exhaustive market export. The "
+              "API does not expose whether a Business Profile is claimed.")
+
+    MAX_RESULTS = 20
+    FIELD_MASK = ",".join((
+        "places.id", "places.displayName", "places.formattedAddress",
+        "places.location", "places.primaryTypeDisplayName",
+        "places.websiteUri", "places.nationalPhoneNumber", "places.rating",
+        "places.userRatingCount", "places.googleMapsUri",
+        "places.businessStatus",
+    ))
+
+    def quota_limit(self, env):
+        return int(env.get("google_places_monthly_limit", 1000))
+
+    def quota_period(self, now):
+        return now.strftime("%Y-%m")
+
+    def request_units(self, query):
+        return 1
+
+    def estimate(self, queries):
+        # The local limiter prevents crossing into paid use. Pricing differs by
+        # field tier and country, so crossing the configured allowance is
+        # refused instead of represented by a misleading paid estimate.
+        return 0.0
+
+    async def fetch(self, client, env, query):
+        wanted = min(max(1, query.limit), self.MAX_RESULTS)
+        sdk = places_v1.PlacesAsyncClient(
+            client_options=ClientOptions(api_key=env["google_maps_api_key"]))
+        try:
+            request = places_v1.SearchTextRequest(
+                text_query=query.keyword(),
+                max_result_count=wanted,
+            )
+            response = await sdk.search_text(
+                request=request,
+                metadata=(("x-goog-fieldmask", self.FIELD_MASK),),
+                timeout=45.0,
+            )
+        finally:
+            await sdk.transport.close()
+        out: list[Business] = []
+        for place in response.places:
+            if (place.business_status ==
+                    places_v1.Place.BusinessStatus.CLOSED_PERMANENTLY):
+                continue
+            site = place.website_uri or ""
+            place_id = place.id or ""
+            out.append(Business(
+                name=place.display_name.text if place.display_name else "",
+                domain=normalize_domain(site),
+                website=site,
+                phone=place.national_phone_number or "",
+                address=place.formatted_address or "",
+                location=query.location,
+                category=(place.primary_type_display_name.text
+                          if place.primary_type_display_name else ""),
+                rating=place.rating or None,
+                review_count=place.user_rating_count or None,
+                has_website=bool(site),
+                external_id=f"google_places:{place_id}" if place_id else "",
+                source_url=place.google_maps_uri or "",
+                provider=self.key,
+            ))
+        return out
+
+
+class GoogleSearch(DiscoveryProvider):
+    """Official Google Custom Search JSON API as a bounded SERP provider."""
+
+    key = "google_serp"
+    label = "Google Custom Search"
+    kind = "serp"
+    blurb = ("Official Google Programmable Search results with organic position. "
+             "Requires an API key and Programmable Search Engine ID.")
+    cost_note = "free for the first 100 API requests/day; Harvey stops at its local cap"
+    free_tier = "100 requests/day; set GOOGLE_SEARCH_DAILY_LIMIT lower for a shared key"
+    signup_url = "https://programmablesearchengine.google.com/"
+    env_keys = ("google_search_api_key", "google_search_engine_id")
+    caveat = ("This is Programmable Search, not an unrestricted export of Google "
+              "Search. One request returns at most 10 results.")
+
+    def quota_limit(self, env):
+        return int(env.get("google_search_daily_limit", 100))
+
+    def request_units(self, query):
+        return max(1, -(-min(query.depth, 100) // 10))
+
+    def estimate(self, queries):
+        return 0.0
+
+    async def fetch(self, client, env, query):
+        depth = min(max(1, query.depth), 100)
+        out: list[Business] = []
+        service = google_build(
+            "customsearch", "v1",
+            developerKey=env["google_search_api_key"],
+            cache_discovery=False,
+        )
+        try:
+            for start in range(1, depth + 1, 10):
+                count = min(10, depth - start + 1)
+                request = service.cse().list(
+                    cx=env["google_search_engine_id"],
+                    q=query.keyword(),
+                    num=count,
+                    start=start,
+                )
+                data = await asyncio.to_thread(request.execute)
+                for offset, item in enumerate(data.get("items") or []):
+                    link = item.get("link") or ""
+                    domain = normalize_domain(link)
+                    if not domain:
+                        continue
+                    out.append(Business(
+                        name=business_name(item.get("title") or "", domain),
+                        raw_title=item.get("title") or "",
+                        domain=domain,
+                        website=link,
+                        location=query.location,
+                        rank=start + offset,
+                        has_website=True,
+                        source_url=link,
+                        provider=self.key,
+                    ))
+        finally:
+            service.close()
+        return out
+
+
 class OpenStreetMap(DiscoveryProvider):
     """Genuinely free, no account, no key. Honest about what that costs you.
 
@@ -731,6 +893,8 @@ PROVIDERS: dict[str, DiscoveryProvider] = {
         DataForSEOListings(),
         DataForSEOSerp(),
         Serper(),
+        GooglePlaces(),
+        GoogleSearch(),
     )
 }
 
@@ -920,6 +1084,16 @@ async def run_discovery(
     )
 
     seen: set[str] = set()
+    now = datetime.now(timezone.utc)
+    quota_limit = provider.quota_limit(env)
+    quota_key = (
+        f"discover_quota:{provider.key}:"
+        f"{provider.quota_period(now)}"
+    )
+    quota_used = (
+        int(await state.get_setting(quota_key) or 0)
+        if quota_limit is not None else 0
+    )
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
             for i, query in enumerate(queries):
@@ -931,10 +1105,23 @@ async def run_discovery(
                 if report.actual_cost > max_spend:
                     report.stopped = "budget reached"
                     break
+                units = provider.request_units(query)
+                if quota_limit is not None and quota_used + units > quota_limit:
+                    report.stopped = "free quota reached"
+                    report.errors.append(
+                        f"{provider.label} local free-usage limit reached "
+                        f"({quota_used}/{quota_limit} requests reserved in the "
+                        f"current quota period)")
+                    break
                 if i and provider.key == "osm":
                     await asyncio.sleep(OpenStreetMap.MIN_INTERVAL)
 
                 try:
+                    # Reserve before calling: failed and partially completed API
+                    # requests can still consume provider quota.
+                    if quota_limit is not None:
+                        quota_used += units
+                        await state.set_setting(quota_key, str(quota_used))
                     provider.last_cost = 0.0
                     found = await provider.fetch(client, env, query)
                     report.actual_cost += provider.last_cost
@@ -992,7 +1179,18 @@ async def _upsert(state, biz: Business, query: DiscoveryQuery) -> tuple[str, boo
         existing = await state.get_company_by_domain(biz.domain)
     if existing is None and biz.external_id:
         existing = await state.get_company_by_external_id(biz.external_id)
+    if existing is None and biz.phone:
+        existing = await state.get_company_by_phone(biz.phone)
     if existing:
+        await state.enrich_company_listing(existing.id, Company(
+            name=biz.name,
+            domain=biz.domain,
+            website=biz.website,
+            phone=biz.phone,
+            industry=biz.category or query.term,
+            location=biz.location or query.location,
+            source_url=biz.source_url,
+        ))
         return existing.id, False
 
     company = Company(

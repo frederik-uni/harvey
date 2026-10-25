@@ -10,6 +10,7 @@ upgrade cleanly in place.
 """
 
 import json
+import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, date, timedelta, timezone
@@ -38,6 +39,15 @@ WRITABLE_EMAIL_STATUSES = ("verified", "risky")
 MANUAL_SEND_KEY = "manual_send:"
 # Outbox cancel reason for mail the user sent by hand instead; undo restores it.
 HAND_SENT_REASON = "sent_by_hand"
+
+
+def _norm_phone(value: str) -> str:
+    """Digits-only phone identity; reject short/local numbers as ambiguous."""
+    digits = re.sub(r"\D", "", value or "")
+    # North American providers inconsistently include the +1 country code.
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    return digits if len(digits) >= 10 else ""
 # Set when you undo someone's opt-out: Harvey's first reply to them after
 # that waits for your approval, even on autopilot. Cleared once it has.
 REVIEW_NEXT_REPLY_KEY = "review_next_reply:"
@@ -456,6 +466,22 @@ MIGRATIONS: list[str] = [
     ALTER TABLE outbox ADD COLUMN approved_by TEXT DEFAULT '';
     UPDATE outbox SET approved_by = 'earlier' WHERE status IN ('approved', 'sending');
     """,
+    # ── v14: indexed cross-provider identity for business phone numbers ──
+    """
+    ALTER TABLE companies ADD COLUMN phone_normalized TEXT DEFAULT '';
+
+    UPDATE companies SET phone_normalized =
+        REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+            phone, '+', ''), ' ', ''), '-', ''), '(', ''), ')', ''), '.', '')
+        WHERE phone != '';
+    UPDATE companies SET phone_normalized = SUBSTR(phone_normalized, 2)
+        WHERE LENGTH(phone_normalized) = 11 AND phone_normalized LIKE '1%';
+    UPDATE companies SET phone_normalized = ''
+        WHERE LENGTH(phone_normalized) < 10;
+
+    CREATE INDEX IF NOT EXISTS idx_companies_phone_normalized
+        ON companies(phone_normalized) WHERE phone_normalized != '';
+    """,
 ]
 
 BRAIN_PROVIDERS = ("claude", "codex")
@@ -549,14 +575,14 @@ class StateManager:
             cursor = await db.execute(
                 """INSERT OR IGNORE INTO companies
                    (id, name, domain, website, description, industry,
-                    company_size, location, phone, source, source_url,
+                    company_size, location, phone, phone_normalized, source, source_url,
                     external_id, notes, tech_stack_json, signals_json,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     company.id, company.name, company.domain, company.website,
                     company.description, company.industry, company.company_size,
-                    company.location, company.phone, company.source,
+                    company.location, company.phone, _norm_phone(company.phone), company.source,
                     company.source_url, company.external_id, company.notes,
                     json.dumps(company.tech_stack), json.dumps(company.signals),
                     company.created_at.isoformat(),
@@ -663,6 +689,49 @@ class StateManager:
             ) as cursor:
                 row = await cursor.fetchone()
                 return self._company_from_row(row) if row else None
+
+    async def get_company_by_phone(self, phone: str) -> Company | None:
+        """Match a listing by phone only when exactly one company owns it.
+
+        Formatting differs across providers, so comparison uses digits. Shared
+        switchboards and franchise numbers are deliberately treated as
+        ambiguous rather than merging unrelated businesses.
+        """
+        wanted = _norm_phone(phone)
+        if not wanted:
+            return None
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM companies WHERE phone_normalized = ?",
+                (wanted,),
+            ) as cursor:
+                matches = await cursor.fetchall()
+        return self._company_from_row(matches[0]) if len(matches) == 1 else None
+
+    async def enrich_company_listing(self, company_id: str, company: Company) -> None:
+        """Fill gaps from a later provider without replacing known facts."""
+        async with self._connect() as db:
+            await db.execute(
+                """UPDATE companies SET
+                       name = COALESCE(NULLIF(name, ''), ?),
+                       domain = COALESCE(NULLIF(domain, ''), ?),
+                       website = COALESCE(NULLIF(website, ''), ?),
+                       industry = COALESCE(NULLIF(industry, ''), ?),
+                       location = COALESCE(NULLIF(location, ''), ?),
+                       phone = COALESCE(NULLIF(phone, ''), ?),
+                       phone_normalized = COALESCE(NULLIF(phone_normalized, ''), ?),
+                       source_url = COALESCE(NULLIF(source_url, ''), ?),
+                       updated_at = ?
+                   WHERE id = ?""",
+                (
+                    company.name, _norm(company.domain), company.website,
+                    company.industry, company.location, company.phone,
+                    _norm_phone(company.phone), company.source_url,
+                    _utcnow().isoformat(), company_id,
+                ),
+            )
+            await db.commit()
 
     async def get_contacts_for_company(self, company_id: str) -> list[Prospect]:
         async with self._connect() as db:
