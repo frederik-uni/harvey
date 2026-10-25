@@ -778,9 +778,24 @@ class SetupWizard:
             logger.info(f"Wrote {config_file}")
             self.config_saved = True
         elif self.config:
-            # Config already exists (from trainer), update behavior settings only
+            # A copied starter template exists in Docker before first setup.
+            # Replace that placeholder with the wizard's complete manual
+            # configuration; a genuinely trained config keeps its product/ICP
+            # and receives behavior updates only.
             try:
                 existing = yaml.safe_load(read_user_text(config_file)) or {}
+                existing_company = (existing.get("persona") or {}).get("company", "")
+                new_company = (self.config.get("persona") or {}).get("company", "")
+                if (existing_company in ("", "Your Company")
+                        and new_company not in ("", "Your Company")):
+                    replacement = dict(self.config)
+                    if self.precleared:
+                        _save_precleared(replacement, self.precleared)
+                    text = yaml.dump(replacement, default_flow_style=False, sort_keys=False)
+                    with open(config_file, "w", encoding="utf-8") as f:
+                        f.write(text)
+                    self.config_saved = True
+                    return
                 existing["usage"] = self.config.get("usage", existing.get("usage", {}))
                 existing["brain"] = self.config["brain"]
                 if "LINKEDIN_EMAIL" in self.env_vars:

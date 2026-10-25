@@ -70,6 +70,26 @@ def finish(wizard):
     wizard._write_config()
 
 
+def test_manual_setup_replaces_the_shipped_placeholder_config(files):
+    wizard = setup.SetupWizard()
+    wizard.config = {
+        "persona": {"name": "Alex", "company": "Example Research",
+                    "role": "Founder", "email": "alex@example.com",
+                    "linkedin": "", "tone": "professional"},
+        "product": {"name": "Research", "description": "Market research",
+                    "pricing": "", "key_benefits": [], "objection_responses": {}},
+        "icp": {"industries": ["SaaS"], "company_size": "1-50",
+                "titles": ["Founder"], "geography": ["US"]},
+        "channels": {"email": {"max_daily_sends": 0, "require_approval": True}},
+    }
+
+    wizard._write_config()
+
+    written = yaml.safe_load(files.config.read_text())
+    assert written["persona"]["company"] == "Example Research"
+    assert written["channels"]["email"]["max_daily_sends"] == 0
+
+
 def test_check_stays_off_unless_the_user_says_yes(files, monkeypatch):
     asked = script(monkeypatch, yes_no=[None], answers=[])
     wizard = setup.SetupWizard()
