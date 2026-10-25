@@ -7,7 +7,9 @@ services:
       - |
         test -f /app/data/harvey.local.yaml ||
           cp /app/harvey.yaml /app/data/harvey.local.yaml
+        touch /app/data/.env
         ln -sf /app/data/harvey.local.yaml /app/harvey.local.yaml
+        ln -sf /app/data/.env /app/.env
         exec python -m harvey.main
     env_file: .env
     volumes:
@@ -45,7 +47,9 @@ services:
       - |
         test -f /app/data/harvey.local.yaml ||
           cp /app/harvey.yaml /app/data/harvey.local.yaml
+        touch /app/data/.env
         ln -sf /app/data/harvey.local.yaml /app/harvey.local.yaml
+        ln -sf /app/data/.env /app/.env
         exec python -m harvey.cli dashboard --host 127.0.0.1 --port 5555
     env_file: .env
     volumes:
